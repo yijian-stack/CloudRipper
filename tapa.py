@@ -968,6 +968,36 @@ def voxelize_with_mapping(
     )
 
 
+def deduplicate_files(files, logger=None):
+    """Remove duplicate files by normalizing basenames (e.g. 'name.csv' == 'name - Cloud.csv').
+
+    When multiple files share the same normalized name, keep the ' - Cloud.csv' version
+    if available, otherwise keep the alphabetically first one.
+    """
+    import re
+    groups = {}
+    for fp in files:
+        bn = os.path.basename(fp)
+        norm = re.sub(r"\s*-\s*Cloud", "", bn, flags=re.IGNORECASE)
+        # Normalize variant like '...10-24-28a.csv' → '...10-24-28.csv'
+        norm = re.sub(r"(\d)a\.csv$", r"\1.csv", norm)
+        norm = norm.lower().strip()
+        groups.setdefault(norm, []).append(fp)
+
+    result = []
+    for norm_key, candidates in groups.items():
+        if len(candidates) == 1:
+            result.append(candidates[0])
+        else:
+            cloud_versions = [f for f in candidates if "- cloud" in os.path.basename(f).lower()]
+            chosen = cloud_versions[0] if cloud_versions else sorted(candidates)[0]
+            if logger is not None:
+                dropped = [os.path.basename(f) for f in candidates if f != chosen]
+                logger.info(f"Dedup: keeping '{os.path.basename(chosen)}', dropping {dropped}")
+            result.append(chosen)
+    return sorted(result)
+
+
 def split_files(files, train_ratio=0.9, seed=42):
     files = sorted(files)
     rng = np.random.RandomState(seed)
@@ -1170,7 +1200,12 @@ def load_scenes(
     downsample_ratios = []
     unit_scales = []
     for fp in files:
-        xyz_raw, feats_raw, inst = read_csv_points(fp, input_dim=input_dim, require_label=(True if input_dim else False))
+        try:
+            xyz_raw, feats_raw, inst = read_csv_points(fp, input_dim=input_dim, require_label=(True if input_dim else False))
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(f"Skipping file (load error): {fp} | {exc}")
+            continue
         xyz, feats_raw, inst, prep_meta = prepare_scene_points(
             xyz_raw,
             feats_raw,
@@ -4070,17 +4105,19 @@ def train(args):
         if not val_files:
             raise ValueError(f"No csv found in val_dir: {args.val_dir}")
         train_files = sorted(files)
+        train_files = deduplicate_files(train_files, logger=logger)
         logger.info(
-            f"Using external validation set | train_dir={args.data_dir} ({len(train_files)} files) | "
+            f"Using external validation set | train_dir={args.data_dir} ({len(train_files)} files after dedup) | "
             f"val_dir={args.val_dir} ({len(val_files)} files)"
         )
     else:
-        train_files, val_files = split_files(files, train_ratio=args.train_split, seed=args.seed)
-        logger.info(f"Total files: {len(files)} | Train: {len(train_files)} | Val: {len(val_files)}")
+        files_dedup = deduplicate_files(sorted(files), logger=logger)
+        train_files, val_files = split_files(files_dedup, train_ratio=args.train_split, seed=args.seed)
+        logger.info(f"Total files: {len(files)} (dedup: {len(files_dedup)}) | Train: {len(train_files)} | Val: {len(val_files)}")
 
     if len(extra_train_files) > 0:
-        extra_train_files = sorted(extra_train_files)
-        logger.info(f"Using extra labeled train dir | extra_train_dir={args.extra_train_dir} ({len(extra_train_files)} files)")
+        extra_train_files = deduplicate_files(sorted(extra_train_files), logger=logger)
+        logger.info(f"Using extra labeled train dir | extra_train_dir={args.extra_train_dir} ({len(extra_train_files)} files after dedup)")
 
     train_scenes = load_scenes(
         train_files + extra_train_files,
@@ -4211,7 +4248,19 @@ def train(args):
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
+    warmup_epochs = int(getattr(args, "warmup_epochs", 5))
+    if warmup_epochs > 0 and args.epochs > warmup_epochs:
+        warmup_sched = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+        )
+        cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=args.lr * 0.05
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
+        )
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
 
     use_amp = bool(args.amp == 1) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -4445,8 +4494,7 @@ def train(args):
         tr_center_pos /= tr_den
 
         do_val = (len(val_scenes) > 0) and (
-            (epoch == start_epoch)
-            or ((epoch + 1) % int(max(1, args.val_interval)) == 0)
+            ((epoch + 1) % int(max(1, args.val_interval)) == 0)
             or ((epoch + 1) == args.epochs)
         )
         if do_val:
@@ -4835,12 +4883,13 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
 
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
     parser.add_argument("--input_dim", type=int, default=6)
-    parser.add_argument("--data_dir", type=str, default=None)
-    parser.add_argument("--val_dir", type=str, default=None)
+    parser.add_argument("--data_dir", type=str, default=os.path.join(_script_dir, "data", "train"))
+    parser.add_argument("--val_dir", type=str, default=os.path.join(_script_dir, "data", "test"))
     parser.add_argument("--extra_train_dir", type=str, default=None)
-    parser.add_argument("--input_dir", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--input_dir", type=str, default=os.path.join(_script_dir, "data", "test"))
+    parser.add_argument("--output_dir", type=str, default=os.path.join(_script_dir, "predictions"))
     parser.add_argument("--train_split", type=float, default=0.9)
 
     parser.add_argument("--normalize_mode", type=str, default="center", choices=["none", "center", "center_scale"])
@@ -4860,7 +4909,7 @@ def main():
     parser.add_argument("--feature_mode", type=str, default="safe", choices=["safe", "legacy"])
     parser.add_argument("--voxel_feature_mode", type=str, default="extra_only", choices=["extra_only", "scene_xyz_extra", "point_inputs"])
 
-    parser.add_argument("--samples_per_scene", type=int, default=5)
+    parser.add_argument("--samples_per_scene", type=int, default=8)
     parser.add_argument("--crop_half_x", type=float, default=8.0)
     parser.add_argument("--crop_half_y", type=float, default=8.0)
     parser.add_argument("--crop_half_z", type=float, default=8.0)
@@ -4888,16 +4937,16 @@ def main():
     parser.add_argument("--aug_bg_dropout_max", type=float, default=0.06)
     parser.add_argument("--aug_normal_noise_std", type=float, default=0.005)
 
-    parser.add_argument("--init_channels", type=int, default=40)
+    parser.add_argument("--init_channels", type=int, default=48)
     parser.add_argument("--norm", type=str, default="gn", choices=["gn", "bn"])
     parser.add_argument("--dropout", type=float, default=0.10)
-    parser.add_argument("--point_refine_dim", type=int, default=96)
+    parser.add_argument("--point_refine_dim", type=int, default=128)
     parser.add_argument("--fg_prior", type=float, default=0.01)
     parser.add_argument("--center_prior", type=float, default=0.02)
     parser.add_argument("--center_prob_mix", type=float, default=0.15)
     parser.add_argument("--center_prob_power", type=float, default=0.50)
     parser.add_argument("--vote_max_offset_norm", type=float, default=4.0)
-    parser.add_argument("--enable_deep_stage", type=int, default=0)
+    parser.add_argument("--enable_deep_stage", type=int, default=1)
     parser.add_argument("--context_stage_max_voxels", type=int, default=280000)
     parser.add_argument("--deep_stage_max_voxels", type=int, default=320000)
     parser.add_argument("--infer_chunk_max_points", type=int, default=260000)
@@ -4907,19 +4956,20 @@ def main():
     parser.add_argument("--infer_chunk_max_span_y", type=float, default=192.0)
     parser.add_argument("--infer_chunk_max_span_z", type=float, default=96.0)
 
-    parser.add_argument("--epochs", type=int, default=170)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--min_epochs_before_stop", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--min_epochs_before_stop", type=int, default=120)
     parser.add_argument("--val_interval", type=int, default=5)
     parser.add_argument("--val_metric", type=str, default="score", choices=["score", "fg_iou"])
     parser.add_argument("--val_output_modes", type=str, default="binary,binary_cc,instance")
     parser.add_argument("--val_eval_thr_limit", type=int, default=9)
     parser.add_argument("--amp", type=int, default=1)
     parser.add_argument("--disable_tqdm", type=int, default=0)
-    parser.add_argument("--model_save_path", type=str, default="tapa_robust_v1.pth")
+    parser.add_argument("--model_save_path", type=str, default=os.path.join(_script_dir, "tapa_model.pth"))
     parser.add_argument("--resume_path", type=str, default=None)
     parser.add_argument("--pretrained_weights", type=str, default=None)
     parser.add_argument("--calibrate_postproc", type=int, default=0)
@@ -4954,7 +5004,7 @@ def main():
     parser.add_argument("--val_thr_num", type=int, default=21)
     parser.add_argument("--default_fg_threshold", type=float, default=0.30)
 
-    parser.add_argument("--model_path", type=str, default="tapa_robust_v1_best.pth")
+    parser.add_argument("--model_path", type=str, default=os.path.join(_script_dir, "tapa_model_best.pth"))
     parser.add_argument("--infer_amp", type=int, default=1)
     parser.add_argument("--fg_threshold", type=float, default=-1.0)
     parser.add_argument("--output_mode", type=str, default="auto", choices=["auto", "instance", "binary", "binary_cc"])
@@ -4981,8 +5031,8 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "train":
-        if not args.data_dir:
-            print("Error: --data_dir required for training")
+        if not args.data_dir or not os.path.isdir(args.data_dir):
+            print(f"Error: --data_dir not found or not a directory: {args.data_dir}")
             return
         train(args)
     else:
