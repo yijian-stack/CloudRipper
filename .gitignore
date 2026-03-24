@@ -1,0 +1,5 @@
+logs/
+predictions/
+*.pth
+__pycache__/
+*.pyc

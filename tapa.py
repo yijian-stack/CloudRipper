@@ -407,46 +407,7 @@ def is_cuda_oom_error(exc: Exception):
     return isinstance(exc, RuntimeError) and ("out of memory" in msg or "cudaerrormemoryallocation" in msg)
 
 
-def coord_hash_4d_torch(coords: torch.Tensor):
-    coords = coords.to(torch.int64)
-    if coords.dim() != 2 or coords.shape[1] != 4:
-        raise ValueError(f"coords must be (N,4), got {tuple(coords.shape)}")
-    b = coords[:, 0]
-    x = coords[:, 1]
-    y = coords[:, 2]
-    z = coords[:, 3]
-    return (((b << 16) | x) << 16 | y) << 16 | z
 
-
-def gather_sparse_to_points(
-    sparse_tensor,
-    point_base_coords: torch.Tensor,
-    stride_div: int,
-):
-    if int(stride_div) <= 1:
-        coarse_coords = point_base_coords.to(torch.int64)
-    else:
-        coarse_coords = point_base_coords.to(torch.int64).clone()
-        coarse_coords[:, 1:] = torch.div(coarse_coords[:, 1:], int(stride_div), rounding_mode="floor")
-
-    sparse_coords = sparse_tensor.indices.to(torch.int64)
-    sparse_hash = coord_hash_4d_torch(sparse_coords)
-    point_hash = coord_hash_4d_torch(coarse_coords)
-
-    sparse_hash_sorted, order = torch.sort(sparse_hash)
-    pos = torch.searchsorted(sparse_hash_sorted, point_hash)
-    valid = pos < sparse_hash_sorted.shape[0]
-    valid_idx = torch.where(valid)[0]
-    if valid_idx.numel() > 0:
-        valid_match = sparse_hash_sorted[pos[valid_idx]] == point_hash[valid_idx]
-        valid = torch.zeros_like(valid, dtype=torch.bool)
-        valid[valid_idx] = valid_match
-
-    out = sparse_tensor.features.new_zeros((point_base_coords.shape[0], sparse_tensor.features.shape[1]))
-    if bool(valid.any()):
-        matched = order[pos[valid]]
-        out[valid] = sparse_tensor.features[matched]
-    return out
 
 
 def partition_scene_indices_recursive(
@@ -1845,29 +1806,7 @@ def _bias_from_prior(prior: float):
     return math.log(p / (1.0 - p))
 
 
-def scatter_scene_feature_stats(point_feat: torch.Tensor, point_batch_ids: torch.Tensor, batch_size: int):
-    feat_dim = int(point_feat.shape[1])
-    mean = point_feat.new_zeros((batch_size, feat_dim))
-    sq = point_feat.new_zeros((batch_size, feat_dim))
-    count = point_feat.new_zeros((batch_size, 1))
 
-    ones = point_feat.new_ones((point_feat.shape[0], 1))
-    mean.index_add_(0, point_batch_ids, point_feat)
-    sq.index_add_(0, point_batch_ids, point_feat * point_feat)
-    count.index_add_(0, point_batch_ids, ones)
-
-    count_safe = count.clamp_min(1.0)
-    mean = mean / count_safe
-    var = (sq / count_safe) - mean * mean
-    std = torch.sqrt(var.clamp_min(0.0) + 1e-6)
-
-    max_feat = point_feat.new_zeros((batch_size, feat_dim))
-    for b in range(int(batch_size)):
-        mask = point_batch_ids == int(b)
-        if bool(mask.any()):
-            max_feat[b] = point_feat[mask].max(dim=0)[0]
-
-    return mean, max_feat, std
 
 
 def unpack_model_outputs(outputs):
@@ -1886,42 +1825,7 @@ def unpack_model_outputs(outputs):
     }
 
 
-class SparseResBlock(nn.Module):
-    def __init__(self, channels: int, norm: str = "gn", indice_key: str = "subm", dropout: float = 0.0, dilation: int = 1):
-        super().__init__()
-        dilation = int(max(1, dilation))
-        padding = dilation
-        self.conv1 = spconv.SubMConv3d(
-            channels,
-            channels,
-            3,
-            padding=padding,
-            dilation=dilation,
-            bias=False,
-            indice_key=indice_key,
-        )
-        self.norm1 = make_norm(channels, norm)
-        self.conv2 = spconv.SubMConv3d(
-            channels,
-            channels,
-            3,
-            padding=padding,
-            dilation=dilation,
-            bias=False,
-            indice_key=indice_key,
-        )
-        self.norm2 = make_norm(channels, norm)
-        self.dropout = nn.Dropout(p=float(dropout)) if float(dropout) > 0 else nn.Identity()
-        self.act = nn.GELU()
 
-    def forward(self, x):
-        identity = x.features
-        out = self.conv1(x)
-        out = out.replace_feature(self.act(self.norm1(out.features)))
-        out = self.conv2(out)
-        feat = self.dropout(self.norm2(out.features))
-        out = out.replace_feature(self.act(feat + identity))
-        return out
 
 
 class SparseFGNet(nn.Module):
@@ -1929,10 +1833,10 @@ class SparseFGNet(nn.Module):
         self,
         in_channels: int,
         point_in_dim: int,
-        init_channels: int = 40,
+        init_channels: int = 24,
         norm: str = "gn",
         dropout: float = 0.1,
-        point_refine_dim: int = 96,
+        point_refine_dim: int = 48,
         fg_prior: float = 0.02,
         center_prior: float = 0.02,
         enable_deep_stage: int = 0,
@@ -1942,9 +1846,6 @@ class SparseFGNet(nn.Module):
         super().__init__()
         C = int(init_channels)
         self.point_in_dim = int(point_in_dim)
-        self.use_deep_stage = bool(int(enable_deep_stage))
-        self.context_stage_max_voxels = int(context_stage_max_voxels)
-        self.deep_stage_max_voxels = int(deep_stage_max_voxels)
 
         def subm(in_c, out_c, key):
             return spconv.SubMConv3d(in_c, out_c, 3, padding=1, bias=False, indice_key=key)
@@ -2003,104 +1904,16 @@ class SparseFGNet(nn.Module):
                 ),
             }
         )
-        self.backbone_extra = nn.ModuleDict(
-            {
-                "res1": nn.Sequential(
-                    SparseResBlock(C, norm=norm, indice_key="subm1", dropout=dropout * 0.5),
-                    SparseResBlock(C, norm=norm, indice_key="subm1", dropout=dropout * 0.5),
-                ),
-                "res2": nn.Sequential(
-                    SparseResBlock(C * 2, norm=norm, indice_key="subm2", dropout=dropout * 0.5),
-                    SparseResBlock(C * 2, norm=norm, indice_key="subm2", dropout=dropout * 0.5),
-                ),
-                "res3": nn.Sequential(
-                    SparseResBlock(C * 4, norm=norm, indice_key="subm3", dropout=dropout * 0.5),
-                    SparseResBlock(C * 4, norm=norm, indice_key="subm3", dropout=dropout * 0.5),
-                ),
-                "ctx2": nn.Sequential(
-                    SparseResBlock(C * 2, norm=norm, indice_key="subm2_ctx_d2", dropout=dropout * 0.5, dilation=2),
-                ),
-                "ctx3": nn.Sequential(
-                    SparseResBlock(C * 4, norm=norm, indice_key="subm3_ctx_d2", dropout=dropout * 0.5, dilation=2),
-                    SparseResBlock(C * 4, norm=norm, indice_key="subm3_ctx_d3", dropout=dropout * 0.5, dilation=3),
-                ),
-                "conv4": spconv.SparseSequential(
-                    spc(C * 4, C * 8, "spconv4", stride=2),
-                    make_norm(C * 8, norm),
-                    nn.ReLU(inplace=True),
-                ),
-                "res4": nn.Sequential(
-                    SparseResBlock(C * 8, norm=norm, indice_key="subm4", dropout=dropout * 0.5),
-                    SparseResBlock(C * 8, norm=norm, indice_key="subm4", dropout=dropout * 0.5),
-                ),
-                "up3": spconv.SparseSequential(
-                    inv(C * 8, C * 4, "spconv4"),
-                    make_norm(C * 4, norm),
-                    nn.ReLU(inplace=True),
-                ),
-                "dec3": spconv.SparseSequential(
-                    subm(C * 8, C * 4, "subm3_dec"),
-                    make_norm(C * 4, norm),
-                    nn.ReLU(inplace=True),
-                ),
-                "resd3": nn.Sequential(
-                    SparseResBlock(C * 4, norm=norm, indice_key="subm3_dec", dropout=dropout * 0.5),
-                ),
-                "resd2": nn.Sequential(
-                    SparseResBlock(C * 2, norm=norm, indice_key="subm2_dec", dropout=dropout * 0.5),
-                ),
-                "resd1": nn.Sequential(
-                    SparseResBlock(C, norm=norm, indice_key="subm1_dec", dropout=dropout * 0.5),
-                ),
-            }
-        )
 
         self.voxel_mlp = nn.Sequential(
-            nn.Linear(C, C),
-            nn.LayerNorm(C),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity(),
             nn.Linear(C, C),
             nn.LayerNorm(C),
             nn.ReLU(inplace=True),
         )
 
         P = int(point_refine_dim)
-        self.point_stem = nn.Sequential(
-            nn.Linear(self.point_in_dim, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-            nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity(),
-            nn.Linear(P, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-        )
-        self.scale_projs = nn.ModuleDict(
-            {
-                "x1": nn.Sequential(nn.Linear(C, P), nn.LayerNorm(P), nn.GELU()),
-                "x2": nn.Sequential(nn.Linear(C * 2, P), nn.LayerNorm(P), nn.GELU()),
-                "x3": nn.Sequential(nn.Linear(C * 4, P), nn.LayerNorm(P), nn.GELU()),
-                "out": nn.Sequential(nn.Linear(C, P), nn.LayerNorm(P), nn.GELU()),
-            }
-        )
-        self.scale_fuse = nn.Sequential(
-            nn.Linear(P * 5, P * 2),
-            nn.LayerNorm(P * 2),
-            nn.GELU(),
-            nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity(),
-            nn.Linear(P * 2, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-        )
-        self.scale_gate = nn.Sequential(
-            nn.Linear(P * 5, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-            nn.Linear(P, P),
-            nn.Sigmoid(),
-        )
         self.point_refine = nn.Sequential(
-            nn.Linear(P, P),
+            nn.Linear(self.point_in_dim + C, P),
             nn.LayerNorm(P),
             nn.GELU(),
             nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity(),
@@ -2108,57 +1921,27 @@ class SparseFGNet(nn.Module):
             nn.LayerNorm(P),
             nn.GELU(),
         )
-
-        ctx_dim = P * 4 + self.point_in_dim
-        self.context_fuse = nn.Sequential(
-            nn.Linear(ctx_dim, P * 2),
-            nn.LayerNorm(P * 2),
-            nn.GELU(),
-            nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity(),
-            nn.Linear(P * 2, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-        )
-        self.context_gate = nn.Sequential(
-            nn.Linear(ctx_dim, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-            nn.Linear(P, P),
-            nn.Sigmoid(),
-        )
-        self.object_trunk = nn.Sequential(
-            nn.Linear(P, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-            nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity(),
-            nn.Linear(P, P),
-            nn.LayerNorm(P),
-            nn.GELU(),
-        )
-
-        head_hidden = P
-
-        def make_head(out_dim: int):
-            return nn.Sequential(
-                nn.Linear(P, head_hidden),
-                nn.LayerNorm(head_hidden),
-                nn.GELU(),
-                nn.Linear(head_hidden, out_dim),
-            )
 
         self.fg_head = nn.Linear(P, 1)
-        self.center_head = make_head(1)
-        self.offset_head = make_head(3)
-        self.size_head = make_head(3)
+        self.center_head = nn.Sequential(
+            nn.Linear(P, P),
+            nn.LayerNorm(P),
+            nn.GELU(),
+            nn.Linear(P, 1),
+        )
+        self.offset_head = nn.Sequential(
+            nn.Linear(P, P),
+            nn.LayerNorm(P),
+            nn.GELU(),
+            nn.Linear(P, 3),
+        )
+        self.size_head = nn.Sequential(
+            nn.Linear(P, P),
+            nn.LayerNorm(P),
+            nn.GELU(),
+            nn.Linear(P, 3),
+        )
 
-        nn.init.constant_(self.scale_fuse[4].weight, 0.0)
-        nn.init.constant_(self.scale_fuse[4].bias, 0.0)
-        nn.init.constant_(self.point_refine[4].weight, 0.0)
-        nn.init.constant_(self.point_refine[4].bias, 0.0)
-        nn.init.constant_(self.context_fuse[4].weight, 0.0)
-        nn.init.constant_(self.context_fuse[4].bias, 0.0)
-        nn.init.constant_(self.object_trunk[4].weight, 0.0)
-        nn.init.constant_(self.object_trunk[4].bias, 0.0)
         nn.init.normal_(self.fg_head.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.fg_head.bias, _bias_from_prior(fg_prior))
         nn.init.normal_(self.center_head[-1].weight, mean=0.0, std=0.01)
@@ -2172,71 +1955,20 @@ class SparseFGNet(nn.Module):
         x = spconv.SparseConvTensor(feats_b, coords_b, spatial_shape=spatial_shape, batch_size=batch_size)
 
         x1 = self.backbone["conv1"](x)
-        x1 = self.backbone_extra["res1"](x1)
         x2 = self.backbone["conv2"](x1)
-        x2 = self.backbone_extra["res2"](x2)
-        x2 = self.backbone_extra["ctx2"](x2)
         x3 = self.backbone["conv3"](x2)
-        x3 = self.backbone_extra["res3"](x3)
-        use_ctx3 = (self.context_stage_max_voxels <= 0) or (int(x3.features.shape[0]) <= self.context_stage_max_voxels)
-        if use_ctx3:
-            x3 = self.backbone_extra["ctx3"](x3)
 
-        use_deep_stage = self.use_deep_stage and ((self.deep_stage_max_voxels <= 0) or (int(x3.features.shape[0]) <= self.deep_stage_max_voxels))
-        if use_deep_stage:
-            x4 = self.backbone_extra["conv4"](x3)
-            x4 = self.backbone_extra["res4"](x4)
-
-            up3 = self.backbone_extra["up3"](x4)
-            cat3 = up3.replace_feature(torch.cat([up3.features, x3.features], dim=1))
-            d3 = self.backbone_extra["dec3"](cat3)
-            d3 = self.backbone_extra["resd3"](d3)
-            up2_in = d3
-        else:
-            up2_in = x3
-
-        up2 = self.backbone["up2"](up2_in)
+        up2 = self.backbone["up2"](x3)
         cat2 = up2.replace_feature(torch.cat([up2.features, x2.features], dim=1))
         d2 = self.backbone["dec2"](cat2)
-        d2 = self.backbone_extra["resd2"](d2)
 
         up1 = self.backbone["up1"](d2)
         cat1 = up1.replace_feature(torch.cat([up1.features, x1.features], dim=1))
         out = self.backbone["dec1"](cat1)
-        out = self.backbone_extra["resd1"](out)
 
         voxel_feat = self.voxel_mlp(out.features)
-        point_base_coords = coords_b[point2voxel].to(torch.int64)
-        point_seed = self.point_stem(point_inputs)
-        point_x1 = self.scale_projs["x1"](gather_sparse_to_points(x1, point_base_coords, stride_div=1))
-        point_x2 = self.scale_projs["x2"](gather_sparse_to_points(x2, point_base_coords, stride_div=2))
-        point_x3 = self.scale_projs["x3"](gather_sparse_to_points(x3, point_base_coords, stride_div=4))
-        point_out = self.scale_projs["out"](voxel_feat[point2voxel])
-
-        local_ctx = torch.cat([point_seed, point_x1, point_x2, point_x3, point_out], dim=1)
-        local_delta = self.scale_fuse(local_ctx)
-        local_gate = self.scale_gate(local_ctx)
-        point_local = point_seed + point_out + local_gate * local_delta
-        point_local = point_local + self.point_refine(point_local)
-
-        if point_batch_ids is None:
-            point_batch_ids = torch.zeros((point_local.shape[0],), dtype=torch.long, device=point_local.device)
-
-        scene_mean, scene_max, scene_std = scatter_scene_feature_stats(point_local, point_batch_ids, batch_size)
-        ctx = torch.cat(
-            [
-                point_local,
-                scene_mean[point_batch_ids],
-                scene_max[point_batch_ids],
-                scene_std[point_batch_ids],
-                point_inputs,
-            ],
-            dim=1,
-        )
-        ctx_delta = self.context_fuse(ctx)
-        ctx_gate = self.context_gate(ctx)
-        fused = point_local + ctx_gate * ctx_delta
-        fused = fused + self.object_trunk(fused)
+        point_voxel_feat = voxel_feat[point2voxel]
+        fused = self.point_refine(torch.cat([point_inputs, point_voxel_feat], dim=1))
 
         fg_logits = self.fg_head(fused).squeeze(1)
         center_logits = self.center_head(fused).squeeze(1)
@@ -3490,8 +3222,8 @@ def load_state_dict_flexible(model, state_dict, logger=None):
     model_sd = model.state_dict()
     remapped = dict(state_dict)
     legacy_map = {
-        "fg_head.weight": "fg_head.3.weight",
-        "fg_head.bias": "fg_head.3.bias",
+        "fg_head.3.weight": "fg_head.weight",
+        "fg_head.3.bias": "fg_head.bias",
     }
     for src, dst in legacy_map.items():
         if src in remapped and dst in model_sd and hasattr(remapped[src], "shape") and remapped[src].shape == model_sd[dst].shape:
@@ -3568,16 +3300,8 @@ def configure_trainable_modules(model: nn.Module, args, logger=None):
     freeze_offset_head = bool(int(getattr(args, "freeze_offset_head", 0)))
 
     set_module_trainable(getattr(model, "backbone", None), not freeze_backbone)
-    set_module_trainable(getattr(model, "backbone_extra", None), not freeze_backbone)
     set_module_trainable(getattr(model, "voxel_mlp", None), not freeze_voxel_mlp)
-    set_module_trainable(getattr(model, "point_stem", None), not freeze_point_refine)
-    set_module_trainable(getattr(model, "scale_projs", None), not freeze_point_refine)
-    set_module_trainable(getattr(model, "scale_fuse", None), not freeze_point_refine)
-    set_module_trainable(getattr(model, "scale_gate", None), not freeze_point_refine)
     set_module_trainable(getattr(model, "point_refine", None), not freeze_point_refine)
-    set_module_trainable(getattr(model, "context_fuse", None), not freeze_context_fuse)
-    set_module_trainable(getattr(model, "context_gate", None), not freeze_context_fuse)
-    set_module_trainable(getattr(model, "object_trunk", None), not freeze_context_fuse)
     set_module_trainable(getattr(model, "fg_head", None), not freeze_fg_head)
     set_module_trainable(getattr(model, "center_head", None), not freeze_center_head)
     set_module_trainable(getattr(model, "offset_head", None), not freeze_offset_head)
@@ -3588,7 +3312,7 @@ def configure_trainable_modules(model: nn.Module, args, logger=None):
     if logger is not None:
         logger.info(
             f"Trainable modules | backbone={int(not freeze_backbone)} | voxel_mlp={int(not freeze_voxel_mlp)} | "
-            f"point_refine={int(not freeze_point_refine)} | context={int(not freeze_context_fuse)} | "
+            f"point_refine={int(not freeze_point_refine)} | "
             f"fg_head={int(not freeze_fg_head)} | center_head={int(not freeze_center_head)} | "
             f"offset_head={int(not freeze_offset_head)} | "
             f"params={trainable}/{total}"
@@ -4901,18 +4625,18 @@ def main():
     parser.add_argument("--coord_unit_scale", type=float, default=0.0)
     parser.add_argument("--auto_unit_normalize", type=int, default=1)
     parser.add_argument("--auto_mm_threshold", type=float, default=200.0)
-    parser.add_argument("--pre_downsample_voxel", type=float, default=0.10)
+    parser.add_argument("--pre_downsample_voxel", type=float, default=0.15)
 
-    parser.add_argument("--voxel_size", type=float, default=0.02)
-    parser.add_argument("--max_points_per_voxel", type=int, default=50)
+    parser.add_argument("--voxel_size", type=float, default=0.06)
+    parser.add_argument("--max_points_per_voxel", type=int, default=20)
     parser.add_argument("--max_voxels", type=int, default=0)
     parser.add_argument("--feature_mode", type=str, default="safe", choices=["safe", "legacy"])
     parser.add_argument("--voxel_feature_mode", type=str, default="extra_only", choices=["extra_only", "scene_xyz_extra", "point_inputs"])
 
-    parser.add_argument("--samples_per_scene", type=int, default=8)
-    parser.add_argument("--crop_half_x", type=float, default=8.0)
-    parser.add_argument("--crop_half_y", type=float, default=8.0)
-    parser.add_argument("--crop_half_z", type=float, default=8.0)
+    parser.add_argument("--samples_per_scene", type=int, default=4)
+    parser.add_argument("--crop_half_x", type=float, default=6.0)
+    parser.add_argument("--crop_half_y", type=float, default=6.0)
+    parser.add_argument("--crop_half_z", type=float, default=6.0)
     parser.add_argument("--positive_fraction", type=float, default=0.45)
     parser.add_argument("--hard_negative_fraction", type=float, default=0.35)
     parser.add_argument("--hard_neg_shell_min", type=float, default=5.0)
@@ -4926,7 +4650,7 @@ def main():
     parser.add_argument("--hard_neg_near_obj_prob", type=float, default=0.65)
     parser.add_argument("--hard_neg_context_margin", type=float, default=2.80)
     parser.add_argument("--hard_neg_exclude_margin", type=float, default=0.70)
-    parser.add_argument("--max_points", type=int, default=24000)
+    parser.add_argument("--max_points", type=int, default=16000)
     parser.add_argument("--aug_jitter_xyz_std", type=float, default=0.010)
     parser.add_argument("--aug_dropout", type=float, default=0.02)
     parser.add_argument("--aug_rotate_z_deg", type=float, default=180.0)
@@ -4937,16 +4661,16 @@ def main():
     parser.add_argument("--aug_bg_dropout_max", type=float, default=0.06)
     parser.add_argument("--aug_normal_noise_std", type=float, default=0.005)
 
-    parser.add_argument("--init_channels", type=int, default=48)
+    parser.add_argument("--init_channels", type=int, default=24)
     parser.add_argument("--norm", type=str, default="gn", choices=["gn", "bn"])
     parser.add_argument("--dropout", type=float, default=0.10)
-    parser.add_argument("--point_refine_dim", type=int, default=128)
+    parser.add_argument("--point_refine_dim", type=int, default=48)
     parser.add_argument("--fg_prior", type=float, default=0.01)
     parser.add_argument("--center_prior", type=float, default=0.02)
     parser.add_argument("--center_prob_mix", type=float, default=0.15)
     parser.add_argument("--center_prob_power", type=float, default=0.50)
     parser.add_argument("--vote_max_offset_norm", type=float, default=4.0)
-    parser.add_argument("--enable_deep_stage", type=int, default=1)
+    parser.add_argument("--enable_deep_stage", type=int, default=0)
     parser.add_argument("--context_stage_max_voxels", type=int, default=280000)
     parser.add_argument("--deep_stage_max_voxels", type=int, default=320000)
     parser.add_argument("--infer_chunk_max_points", type=int, default=260000)
@@ -4958,12 +4682,12 @@ def main():
 
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--warmup_epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--min_epochs_before_stop", type=int, default=120)
-    parser.add_argument("--val_interval", type=int, default=5)
+    parser.add_argument("--val_interval", type=int, default=10)
     parser.add_argument("--val_metric", type=str, default="score", choices=["score", "fg_iou"])
     parser.add_argument("--val_output_modes", type=str, default="binary,binary_cc,instance")
     parser.add_argument("--val_eval_thr_limit", type=int, default=9)
@@ -5045,13 +4769,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-    """
-    python tap.py predict --input_dir "D:\company\0125\门机\datarec\grabarti_intsega" --output_dir "D:\company\0125\门机\datarec\grabarti_intsegb" --model_path fginst_sparsecrop_v1_best.pth
-    
-    python tap.py predict   --input_dir "D:\company\0125\门机\datarec\grabarti_intsega"   --output_dir "D:\company\0125\门机\datarec\grabarti_intsegb"   --model_path fginst_sparsecrop_v1_best.pth   --seed_threshold 0.55   --grow_threshold 0.20  --support_threshold 0.08 --cluster_eps 0.60 --grow_cluster_min_samples 6 --seed_min_points 20 --support_radius 1.00 --merge_xy_gap 1.80 --merge_z_gap 3.20 --merge_xy_overlap 0.20 --keep_topk 3
-    python tap.py predict   --input_dir "D:\company\0125\门机\datarec\tempdatanxyz"   --output_dir "D:\company\0125\门机\datarec\tempdatanxyzb"   --model_path fginst_sparsecrop_v1_best.pth   --seed_threshold 0.55   --grow_threshold 0.20  --support_threshold 0.08 --cluster_eps 0.60 --grow_cluster_min_samples 6 --seed_min_points 20 --support_radius 1.00 --merge_xy_gap 1.80 --merge_z_gap 3.20 --merge_xy_overlap 0.20 --keep_topk 3
-
-    D:\company\0125\门机\datarec\tempdatanxyz
-    python tap.py predict --input_dir "D:\company\0125\门机\datarec\grabarti_intsega" --output_dir "D:\company\0125\门机\datarec\tempdatanxyzb" --model_path fginst_sparsecrop_v1_best.pth
-    """
