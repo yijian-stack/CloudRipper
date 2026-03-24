@@ -3222,8 +3222,8 @@ def load_state_dict_flexible(model, state_dict, logger=None):
     model_sd = model.state_dict()
     remapped = dict(state_dict)
     legacy_map = {
-        "fg_head.weight": "fg_head.3.weight",
-        "fg_head.bias": "fg_head.3.bias",
+        "fg_head.3.weight": "fg_head.weight",
+        "fg_head.3.bias": "fg_head.bias",
     }
     for src, dst in legacy_map.items():
         if src in remapped and dst in model_sd and hasattr(remapped[src], "shape") and remapped[src].shape == model_sd[dst].shape:
